@@ -1,0 +1,438 @@
+$ErrorActionPreference = "Stop"; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Add-Type -AssemblyName PresentationFramework
+
+###################################################### 检查当前用户是否属于管理员组
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (!$isAdmin)
+{
+	Write-Host "很遗憾! 电脑当前登陆的用户『$($env:USERNAME)』没有管理员权限, 我无法执行! `n若仍想执行, 请按如下步骤操作:`n`n1.先注销当前用户,选择『Administrator』帐户登陆;`n2.然后执行D盘下名为『__将$($env:USERNAME)用户加入管理员组.bat』的文件;`n3.重启系统,选择『$($env:USERNAME)』用户登陆;`n4.再次尝试在运行框中执行我`n`n20秒后自动退出！"
+	$cmdContent = @"
+%1 mshta vbscript:CreateObject("Shell.Application").ShellExecute("cmd.exe","/c %~s0 ::","","runas",1)(window.close)&&exit
+net localgroup Administrators "$env:USERNAME" /add
+echo "$env:USERNAME 用户, 已成功添加到管理员组!"
+"@
+	Set-Content -Path "D:\__将$($env:USERNAME)用户加入管理员组.bat" -Value $cmdContent
+    sleep 20
+    exit
+}
+
+###################################################### 检测杀毒或防毒软件
+# 定义进程名-杀毒或防毒软件名的哈希表
+$processInfo = @{
+    "360sd"   = "360杀毒"
+    "360Tray" = "360安全卫士"
+    "HipsTray" = "火绒安全软件"
+}
+
+function Check-Processes {
+    foreach ($processName in $processInfo.Keys) {
+        $process = Get-Process -Name $processName -ErrorAction SilentlyContinue
+        if ($process) {
+            # 返回对应的软件名称
+            return $processInfo[$processName]
+        }
+    }
+    return $null
+}
+
+# 初始化检查
+$softwareName = Check-Processes
+
+# 如果检测到任何一个进程在运行
+while ($softwareName) {
+    # 弹出消息框，显示两个按钮：确定 和 取消
+    $result = [Windows.MessageBox]::Show("您的系统当前正在运行『$softwareName』, 它阻止了我的运行!`n`n〓 如果您仍想运行我, 请按如下步骤操作：`n1.先在桌面任务栏右下角找到『$softwareName』的图标；`n2.在图标上方按下鼠标右键 -> 选择退出项 -> 确认退出；`n3.最后单击『确定』按钮再次尝试运行我。`n`n〓 如果您不想运行我：单击 X 或『取消』按钮。", "警告", 'OKCancel', 'Warning')
+
+    if ($result -eq 'Cancel') {
+        # 用户选择取消，退出脚本
+        Write-Host "用户选择取消，脚本退出。"
+        exit
+    } elseif ($result -eq 'OK') {
+        # 用户选择确定，再次检查进程
+        $softwareName = Check-Processes
+        if (-not $softwareName) {
+            cls
+            Write-Host "未检测到流行杀毒或防毒软件的相关进程，继续执行脚本。"
+            break
+        } else {
+            cls
+            Write-Host "检测到『$softwareName』相关进程，等待用户关闭。"
+        }
+    }
+}
+
+###################################################### 选择要克隆的系统
+do
+{
+	cls
+	Write-Host "请选择要克隆的系统："
+	Write-Host "1. 克隆W10L"
+	Write-Host "2. 克隆W10"
+	Write-Host "0. 退出安装"
+	$choice = Read-Host "输入序号（0, 1, 2）后回车执行"
+	
+	switch ($choice)
+	{
+		"1" { cls; Write-Host "你选择了克隆W10L"; $sys = "W10L" }
+		"2" { cls; Write-Host "你选择了克隆W10"; $sys = "W10" }
+		"0" { cls; Write-Host "退出安装"; return }
+	}
+}
+until ($choice -in "0", "1", "2"); $sys = $sys.Trim()
+
+###################################################### 在指定的文件获取指定的文件
+function getSeekFile
+{
+	param (
+		[string]$seekFolder,
+		[string]$seekFile,
+		[string]$fileHash,
+		[array]$downLink,
+		# 下载链接数组
+		[int]$maxFreeSpace
+	)
+	
+	function DownloadFile
+	{
+		param (
+			[string]$url,
+			[string]$outputPath
+		)
+		try
+		{
+			(New-Object System.Net.WebClient).DownloadFile($url, $outputPath)
+			return $true
+		}
+		catch
+		{
+			return $false
+		}
+	}
+	
+	function VerifyFileHash
+	{
+		param (
+			[string]$filePath,
+			[string]$expectedHash
+		)
+		try
+		{
+			$stream = [System.IO.File]::OpenRead($filePath)
+			$sha256 = [System.Security.Cryptography.SHA256]::Create()
+			$computedHashBytes = $sha256.ComputeHash($stream)
+			$stream.Close()
+			$computedHash = [BitConverter]::ToString($computedHashBytes) -replace '-'
+			return $computedHash -eq $expectedHash
+		}
+		catch
+		{
+			return $false
+		}
+	}
+	
+	function FindOrCreateFolder
+	{
+		param (
+			[string]$seekFolder,
+			[int]$maxFreeSpace
+		)
+		
+		# 获取所有 MediaType 为 "Fixed hard disk media" 的硬盘
+		$nonUSBDisks = Get-CimInstance -ClassName Win32_DiskDrive | Where-Object { $_.MediaType -eq 'Fixed hard disk media' }
+		$maxFreeSpaceInBytes = $maxFreeSpace * 1024 * 1024 * 1024
+		$folderFound = $false
+		$targetDrive = $null
+		
+		# 遍历每个硬盘的分区
+		foreach ($disk in $nonUSBDisks)
+		{
+			# 获取与磁盘关联的分区
+			$partitions = Get-CimInstance -Query "ASSOCIATORS OF {Win32_DiskDrive.DeviceID='$($disk.DeviceID)'} WHERE AssocClass=Win32_DiskDriveToDiskPartition"
+			
+			foreach ($partition in $partitions)
+			{
+				# 获取与分区关联的卷
+				$volumes = Get-CimInstance -Query "ASSOCIATORS OF {Win32_DiskPartition.DeviceID='$($partition.DeviceID)'} WHERE AssocClass=Win32_LogicalDiskToPartition"
+				
+				foreach ($volume in $volumes)
+				{
+					if ($volume.DeviceID)
+					{
+						$folderPath = "$($volume.DeviceID)\$seekFolder"
+						if (Test-Path $folderPath)
+						{
+							# 如果找到文件夹，返回它的路径
+							return [PSCustomObject]@{ Found = $true; Path = $folderPath }
+						}
+						elseif ($volume.FreeSpace -gt $maxFreeSpaceInBytes)
+						{
+							# 记录最大可用空间的分区
+							if ($null -eq $targetDrive -or $volume.FreeSpace -gt $targetDrive.FreeSpace)
+							{
+								$targetDrive = $volume
+							}
+						}
+					}
+				}
+			}
+		}
+		
+		# 如果没有找到文件夹但有足够空间的分区，创建文件夹
+		if (-not $folderFound -and $null -ne $targetDrive)
+		{
+			$newFolderPath = "$($targetDrive.DeviceID)\$seekFolder"
+			New-Item -Path $newFolderPath -ItemType Directory | Out-Null
+			return [PSCustomObject]@{ Found = $true; Path = $newFolderPath }
+		}
+		else
+		{
+			# 如果没有找到合适的分区，返回失败
+			return [PSCustomObject]@{ Found = $false; Path = $null }
+		}
+	}
+	
+	function ExtractZipFile
+	{
+		param (
+			[string]$zipFilePath,
+			[string]$extractPath
+		)
+		Add-Type -AssemblyName 'System.IO.Compression.FileSystem'
+		[System.IO.Compression.ZipFile]::ExtractToDirectory($zipFilePath, $extractPath)
+	}
+	
+	function SearchFileInUSBDrives
+	{
+		param (
+			[string]$seekFolder,
+			[string]$seekFile
+		)
+		
+		# 尝试获取所有 USB 设备
+		$usbDisks = Get-CimInstance -ClassName Win32_DiskDrive | Where-Object { $_.MediaType -ne 'Fixed hard disk media' }
+		
+		# 遍历所有找到的磁盘，查找文件
+		foreach ($disk in $usbDisks)
+		{
+			# 通过 Win32_DiskDrive 和 Win32_DiskPartition 的关联获取分区信息
+			$partitions = Get-CimInstance -Query "ASSOCIATORS OF {Win32_DiskDrive.DeviceID='$($disk.DeviceID)'} WHERE AssocClass=Win32_DiskDriveToDiskPartition"
+			
+			foreach ($partition in $partitions)
+			{
+				# 通过 Win32_DiskPartition 和 Win32_LogicalDisk 的关联获取卷信息
+				$volumes = Get-CimInstance -Query "ASSOCIATORS OF {Win32_DiskPartition.DeviceID='$($partition.DeviceID)'} WHERE AssocClass=Win32_LogicalDiskToPartition"
+				
+				foreach ($volume in $volumes)
+				{
+					if ($volume.DeviceID)
+					{
+						# 直接使用 $volume.DeviceID 来构建文件路径
+						$folderPath = "$($volume.DeviceID)\$seekFolder"
+						$filePath = "$folderPath\$seekFile"
+						
+						if (Test-Path $filePath)
+						{
+							return $filePath
+						}
+					}
+				}
+			}
+		}
+		
+		return $null
+	}
+	
+	$result = [PSCustomObject]@{ success = $false; filePath = $null }
+	
+	# 检查是否存在 $seekFolder 文件夹
+	$folderInfo = FindOrCreateFolder -seekFolder $seekFolder -maxFreeSpace $maxFreeSpace
+	if (-not $folderInfo.Found)
+	{
+		return $result
+	}
+	
+	$targetFolder = $folderInfo.Path
+	$targetFile = Join-Path $targetFolder $seekFile
+	
+	# 如果文件存在且校验通过
+	if (Test-Path $targetFile)
+	{
+		if (VerifyFileHash -filePath $targetFile -expectedHash $fileHash)
+		{
+			$result.success = $true
+			
+			$fileExtension = [System.IO.Path]::GetExtension($targetFile)
+			$tempFolderName = [System.IO.Path]::GetFileNameWithoutExtension($targetFile)
+			if ($fileExtension -eq ".zip") { $result.filePath = "$targetFolder\$tempFolderName\$tempFolderName.exe" }
+			else { $result.filePath = $targetFile }
+			
+			return $result
+		}
+	}
+	
+	# 文件不存在或哈希校验失败时，先从 USB 分区查找文件
+	$usbFilePath = SearchFileInUSBDrives -seekFolder $seekFolder -seekFile $seekFile
+	if ($usbFilePath)
+	{
+		# 复制文件到目标文件夹
+		Copy-Item -Path $usbFilePath -Destination $targetFile -Force
+		
+		# 验证拷贝过来的文件哈希
+		if (VerifyFileHash -filePath $targetFile -expectedHash $fileHash)
+		{
+			$result.success = $true
+			
+			$fileExtension = [System.IO.Path]::GetExtension($targetFile)
+			$tempFolderName = [System.IO.Path]::GetFileNameWithoutExtension($targetFile)
+			if ($fileExtension -eq ".zip")
+			{
+				
+				$tempFolderName = [System.IO.Path]::GetFileNameWithoutExtension($targetFile)
+				$unzipFolder = Join-Path $targetFolder $tempFolderName
+				if (Test-Path $unzipFolder)
+				{
+					Remove-Item -Path $unzipFolder -Recurse -Force
+				}
+				else
+				{
+					New-Item -Path $unzipFolder -ItemType Directory | Out-Null
+				}
+				
+				# 解压缩文件到目标文件夹
+				ExtractZipFile -zipFilePath $targetFile -extractPath $unzipFolder
+				
+				$result.filePath = "$targetFolder\$tempFolderName\$tempFolderName.exe"
+			}
+			else { $result.filePath = $targetFile }
+			
+			return $result
+		}
+	}
+	
+	# 如果 USB 分区没有找到文件，按顺序尝试数组中的链接下载文件
+	$downloadSuccess = $false
+	foreach ($url in $downLink)
+	{
+		if (DownloadFile -url $url -outputPath $targetFile)
+		{
+			if (VerifyFileHash -filePath $targetFile -expectedHash $fileHash)
+			{
+				$downloadSuccess = $true
+				break
+			}
+		}
+	}
+	
+	# 处理下载成功的文件
+	if ($downloadSuccess)
+	{
+		$fileExtension = [System.IO.Path]::GetExtension($seekFile)
+		if ($fileExtension -eq ".zip")
+		{
+			$tempFolderName = [System.IO.Path]::GetFileNameWithoutExtension($seekFile)
+			$unzipFolder = Join-Path $targetFolder $tempFolderName
+			if (Test-Path $unzipFolder)
+			{
+				Remove-Item -Path $unzipFolder -Recurse -Force
+			}
+			else
+			{
+				New-Item -Path $unzipFolder -ItemType Directory | Out-Null
+			}
+			
+			# 解压缩文件到目标文件夹
+			ExtractZipFile -zipFilePath $targetFile -extractPath $unzipFolder
+			
+			# 查找解压后的 .exe 文件
+			$exeFilePath = Join-Path $unzipFolder "$tempFolderName.exe"
+			if (Test-Path $exeFilePath)
+			{
+				$result.success = $true
+				$result.filePath = $exeFilePath
+			}
+			else
+			{
+				Write-Host "未找到解压后的 .exe 文件。"
+			}
+		}
+		else
+		{
+			$result.success = $true
+			$result.filePath = $targetFile
+		}
+	}
+	
+	return $result
+}
+
+# 获取IFW.exe文件路径
+$IFW = "IFW.zip"
+$arg = @{
+	seekFolder = "__bbwb.xyz__\BAK"
+	seekFile   = $IFW
+	fileHash   = "74677C86CF8B2F9218225D7308D72119D60BD13FD01D952B76C6F13F895EBC60"
+	downLink   = @(
+		"https://ixbkgg.ph.files.1drv.com/y4mS5lFx51Pbx6N3Q6ePfs8mB4AKE2yoO6WP8l_jn0P7lTf3O45vA0MxUHdAdJsbczm_n7Jzhyg7ezBheg_nUP1cxbmlOFItCQ4XPuNV_zsZsc4aF4Y3WrfjibO-AQABfZ81Yn2zrOXWOOA7pfIR7NDEKfRkYTyVooEQq1C6AV-moNQdlX7AHFsFKv2OZ6zO-1OzWyStX2BIBN_kcMQWKK-aw/IFW.zip?authkey=%21AGDXhl-u0EUHuls",
+		"http://storage.live.com/items/D05F0DDCCC7EB723!123:/IFW.zip?authkey=%21AGDXhl-u0EUHuls"
+	)
+	maxFreeSpace = 10
+}
+$result = getSeekFile @arg; if (!$result.success) { Write-Host "未能找到 $IFW 文件或下载失败。"; return }
+$IFW = $result.filePath
+Write-Host "文件已找到或下载成功: $IFW"
+
+### —————————————————————————————————————————————————— return
+
+# 获取系统分页文件设置
+$system = Get-WmiObject -Class Win32_ComputerSystem
+# 检查 AutomaticManagedPagefile 是否为 True 并取消自动管理
+if ($system.AutomaticManagedPagefile) 
+{
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" -Name "PagingFiles" -Value @() -Type MultiString
+}
+else
+{
+    # 获取目标硬盘号和分区号: disk@part
+    $dp = "$(Split-Path $IFW -Qualifier)\__bbwb.xyz__\SYS\WIN\$sys\d@p"
+    $td = (gc $dp).Trim()
+
+    # 使用IFW克隆当前系统到目标硬盘中的分区  /csigut  /chgvsn
+    Start "$IFW" '/wait', '/copy', "/sd:?$env:SystemDrive", "/td:w$td", '/x', '/uy', '/ui' -wait
+
+    # UEFI下修复Win+Pe引导
+    if (bcdedit /enum | findstr /i "efi") { 
+    $parts = $td -split '@'; $diskNumber = [int]$parts[0]; $partitionNumber = [int]$parts[1]
+    $systemDrive = "$((Get-Partition $diskNumber | ? { $_.PartitionNumber -eq $partitionNumber }).DriveLetter):"; $systemDrive
+    # 修复WIN
+    #$id0 = "{00cd61cd-dc4e-4445-b787-d12b00a456a7}"
+    $id0 = [regex]::Match((& bcdedit), 'displayorder\s+(\{[^\}]+\})').Groups[1].Value; $id0
+    bcdedit /set $id0 osdevice "partition=$systemDrive" #> $null
+    bcdedit /set $id0 device "partition=$systemDrive" #> $null
+    # 修复PE
+    $id1 = "{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeede1}"
+    $id2 = "{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeede2}"
+    bcdedit /set $id2 ramdisksdidevice "partition=$systemDrive" #> $null
+    bcdedit /set $id1 device "ramdisk=[$systemDrive]\EFI\BOOT\BOOT.wim,$id2" > $null
+    bcdedit /set $id1 osdevice "ramdisk=[$systemDrive]\EFI\BOOT\BOOT.wim,$id2" > $null
+    }
+
+    #删除d@p
+    #del $dp -Force
+    
+    # 删除运行历史记录
+    Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU" -Name * -Force
+}
+
+# C盘下无用的文件夹
+$pa = @(
+	"C:\Intel"
+	"C:\PerfLogs"
+	"C:\Recovery"
+	"$env:TEMP\*"
+	"$env:SystemRoot\Setup\*"
+	"$env:SystemRoot\Panther\*"
+); Remove-Item -Path $pa -Recurse -Force -EA 0
+
+if (2 -ne (New-Object -Com WScript.Shell).popup("8 秒后自动重启系统`n`n不想重启? 点 X 或『取消』按钮!", 8, "提示:", 1)){ shutdown /r /t 1 }
+
+# 设置C:虚拟内存
+#Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" -Name "PagingFiles" -Value "C:\pagefile.sys 0 0" -Type MultiString
